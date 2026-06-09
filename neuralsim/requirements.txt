@@ -1,0 +1,4 @@
+mne>=1.5
+numpy>=1.23
+# Optional, for the CSP+LDA decoder (pip install -e .[sklearn]):
+# scikit-learn>=1.1
