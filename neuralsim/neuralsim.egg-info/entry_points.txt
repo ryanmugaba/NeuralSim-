@@ -1,0 +1,2 @@
+[console_scripts]
+neuralsim-demo = neuralsim.demo:main

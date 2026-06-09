@@ -1,0 +1,8 @@
+mne>=1.5
+numpy>=1.23
+
+[dev]
+pytest>=7
+
+[sklearn]
+scikit-learn>=1.1
