@@ -1,11 +1,8 @@
 """Signal decoding: turn an EEG trial into one of the 4 commands.
 
-The default decoder is deliberately dependency-light (NumPy only): it computes
-mu (8-12 Hz) and beta (13-30 Hz) band power per motor-cortex channel via an FFT,
-z-scores the features, and classifies by nearest class centroid.
-
-This is transparent and fast, not state-of-the-art. For higher accuracy install
-the ``[sklearn]`` extra and use :class:`CSPDecoder`, which runs MNE's CSP + LDA.
+BandPowerDecoder uses log band power across delta/theta/alpha/beta/gamma bands
+and a scikit-learn RandomForestClassifier with 5-fold cross-validation at fit
+time.  CSPDecoder is kept unchanged.
 """
 
 from __future__ import annotations
@@ -14,7 +11,14 @@ import numpy as np
 
 from .commands import Command
 
-DEFAULT_BANDS = ((8.0, 12.0), (13.0, 30.0))  # mu, beta
+# Five canonical EEG bands
+DEFAULT_BANDS = (
+    (0.5, 4.0),   # delta
+    (4.0, 8.0),   # theta
+    (8.0, 13.0),  # alpha
+    (13.0, 30.0), # beta
+    (30.0, 50.0), # gamma
+)
 
 
 def band_power(trial: np.ndarray, sfreq: float, bands=DEFAULT_BANDS) -> np.ndarray:
@@ -45,16 +49,15 @@ def band_power(trial: np.ndarray, sfreq: float, bands=DEFAULT_BANDS) -> np.ndarr
 
 
 class BandPowerDecoder:
-    """NumPy-only nearest-centroid decoder over mu/beta band power."""
+    """Random Forest decoder over 5-band (delta/theta/alpha/beta/gamma) power features."""
 
     def __init__(self, ch_indices=None, sfreq: float = 160.0, bands=DEFAULT_BANDS):
         self.ch_indices = ch_indices
         self.sfreq = float(sfreq)
         self.bands = bands
         self.classes_ = None
-        self.centroids_ = None
-        self.mean_ = None
-        self.std_ = None
+        self._clf = None
+        self._class_map = None
 
     def _pick(self, trial: np.ndarray) -> np.ndarray:
         return trial if self.ch_indices is None else trial[self.ch_indices]
@@ -63,36 +66,44 @@ class BandPowerDecoder:
         return np.array([band_power(self._pick(t), self.sfreq, self.bands) for t in X])
 
     def fit(self, X, y) -> "BandPowerDecoder":
-        """Fit on trials ``X`` (n_trials, n_ch, n_times) and labels ``y``."""
+        """Fit on trials X (n_trials, n_ch, n_times) and labels y."""
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import cross_val_score
+
         F = self._features(X)
-        self.mean_ = F.mean(axis=0)
-        self.std_ = F.std(axis=0) + 1e-9
-        Fz = (F - self.mean_) / self.std_
-        y = [Command(v) for v in y]
-        self.classes_ = sorted({v.value for v in y})
-        self.centroids_ = {
-            c: Fz[[i for i, yy in enumerate(y) if yy.value == c]].mean(axis=0)
-            for c in self.classes_
-        }
+        y_vals = np.array([Command(v).value for v in y])
+        self.classes_ = sorted(set(y_vals.tolist()))
+        self._class_map = {c: i for i, c in enumerate(self.classes_)}
+        yi = np.array([self._class_map[v] for v in y_vals])
+
+        self._clf = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=1,
+            max_features="sqrt",
+            class_weight="balanced",
+            random_state=0,
+            n_jobs=-1,
+        )
+        cv_scores = cross_val_score(self._clf, F, yi, cv=5, scoring="accuracy")
+        print(f"  [RF] 5-fold CV accuracy: {cv_scores.mean():.1%} ± {cv_scores.std():.1%}")
+        self._clf.fit(F, yi)
         return self
 
     def predict_one(self, trial: np.ndarray):
         """Classify a single trial.
 
-        Returns ``(command, confidence, scores)`` where ``scores`` maps each
-        class to a softmax confidence in [0, 1].
+        Returns (command, confidence, scores) where scores maps each
+        class value to a probability in [0, 1].
         """
-        if self.centroids_ is None:
+        if self._clf is None:
             raise RuntimeError("Decoder is not fitted. Call fit() first.")
         f = band_power(self._pick(trial), self.sfreq, self.bands)
-        fz = (f - self.mean_) / self.std_
-        dists = np.array([np.linalg.norm(fz - self.centroids_[c]) for c in self.classes_])
-        logits = -dists
-        ex = np.exp(logits - logits.max())
-        probs = ex / ex.sum()
-        scores = {c: float(p) for c, p in zip(self.classes_, probs)}
-        best = self.classes_[int(np.argmax(probs))]
-        return Command(best), float(probs.max()), scores
+        proba = self._clf.predict_proba(f[None])[0]
+        best_idx = int(np.argmax(proba))
+        best_class = self.classes_[best_idx]
+        scores = {c: float(p) for c, p in zip(self.classes_, proba)}
+        return Command(best_class), float(proba[best_idx]), scores
 
     def predict(self, X):
         return [self.predict_one(t)[0] for t in X]
