@@ -9,8 +9,9 @@ import sys
 import numpy as np
 
 from .commands import ALL_COMMANDS, Command
-from .data import BCIDataset, load_eegbci, make_synthetic
+from .data import BCIDataset, load_eegbci, load_eegbci_multi, make_synthetic
 from .decoder import BandPowerDecoder, CSPDecoder
+from .noise import NoiseInjector
 from .stream import BCIStream
 
 _ARROW = {Command.LEFT: "<--", Command.RIGHT: "-->", Command.SELECT: "[OK]", Command.IDLE: "..."}
@@ -144,10 +145,66 @@ def run_calibration_demo(dataset: BCIDataset, decoder: BandPowerDecoder,
     print("  " + "-" * 64 + "\n")
 
 
+def run_noise_test(dataset: BCIDataset, train_frac: float = 0.7, seed: int = 0) -> None:
+    """Run the decoder at three noise levels and show base accuracy."""
+    print("\n[NEURALSIM NOISE TEST]")
+
+    Xtr, ytr, _, _ = _split(dataset, train_frac, seed)
+    decoder = BandPowerDecoder(ch_indices=dataset.motor_indices, sfreq=dataset.sfreq)
+    decoder.fit(Xtr, ytr)
+
+    rng = np.random.default_rng(seed + 12)
+    motor_idx = dataset.motor_indices
+    channel_scale = rng.lognormal(0.0, 1.0, size=len(motor_idx))
+
+    all_sigs, all_cmds = [], []
+    for sig, cmd in zip(dataset.signals, dataset.commands):
+        s = sig.astype(float).copy()
+        s[motor_idx] *= channel_scale[:, None]
+        all_sigs.append(s)
+        all_cmds.append(cmd)
+
+    order = rng.permutation(len(all_cmds))
+    test_trials = [all_sigs[i] for i in order]
+    test_labels = [all_cmds[i] for i in order]
+
+    print(f"  Test set: {len(test_trials)} trials\n")
+
+    levels = [
+        ("Clean data         ", None),
+        ("Noise severity 0.5 ", 0.5),
+        ("Noise severity 1.0 ", 1.0),
+    ]
+
+    for label, severity in levels:
+        if severity is None:
+            noisy_test = test_trials
+        else:
+            test_inj = NoiseInjector(severity=severity)
+            noisy_test = [
+                test_inj.inject(t, ch_names=dataset.ch_names, sfreq=dataset.sfreq)
+                for t in test_trials
+            ]
+
+        base_correct = sum(
+            decoder.predict_one(sig)[0] == cmd
+            for sig, cmd in zip(noisy_test, test_labels)
+        )
+        base_acc = base_correct / len(test_labels)
+
+        print(f"{label} → base: {base_acc:.0%}")
+
+    print()
+    print("  Personal calibration pending hardware validation (OpenBCI Cyton)")
+    print()
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="neuralsim-demo",
                                 description="Replay EEG motor imagery as a live BCI in the terminal.")
     p.add_argument("--subject", type=int, default=1, help="PhysioNet subject id (1-109).")
+    p.add_argument("--subjects", type=int, default=None,
+                   help="Load S001 through S<N> and combine their trials (e.g. --subjects 10 loads S001-S010, --subjects 109 loads all).")
     p.add_argument("--synthetic", action="store_true",
                    help="Skip the download; use a synthetic stand-in dataset.")
     p.add_argument("--speed", type=float, default=8.0, help="Replay speed multiplier (1 = real time).")
@@ -155,6 +212,8 @@ def main(argv=None) -> int:
     p.add_argument("--csp", action="store_true", help="Use CSP+LDA decoder (needs the [sklearn] extra).")
     p.add_argument("--calibrate", action="store_true",
                    help="After the main demo, run a personal calibration simulation.")
+    p.add_argument("--noise", action="store_true",
+                   help="Run a noise robustness test at severity 0.0, 0.5, and 1.0.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
 
@@ -162,8 +221,12 @@ def main(argv=None) -> int:
         ds = make_synthetic(seed=args.seed)
     else:
         try:
-            print("Loading PhysioNet EEGBCI (first run downloads ~50 MB)...")
-            ds = load_eegbci(subject=args.subject)
+            if args.subjects is not None:
+                print(f"Loading PhysioNet EEGBCI subjects S001-S{args.subjects:03d}...")
+                ds = load_eegbci_multi(subjects=range(1, args.subjects + 1))
+            else:
+                print("Loading PhysioNet EEGBCI (first run downloads ~50 MB)...")
+                ds = load_eegbci(subject=args.subject)
         except Exception as exc:  # network/download issues -> graceful fallback
             print(f"  Could not load real data ({exc.__class__.__name__}: {exc}).")
             print("  Falling back to --synthetic so you can still see it run.\n")
@@ -180,6 +243,12 @@ def main(argv=None) -> int:
             cal_decoder = BandPowerDecoder(ch_indices=ds.motor_indices, sfreq=ds.sfreq)
             cal_decoder.fit(Xtr, ytr)
             run_calibration_demo(ds, cal_decoder, seed=args.seed)
+
+    if args.noise:
+        if args.csp:
+            print("  --noise is not supported with --csp (needs EEGNet backbone).\n")
+        else:
+            run_noise_test(ds, train_frac=args.train_frac, seed=args.seed)
 
     return 0
 

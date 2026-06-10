@@ -81,13 +81,11 @@ def _epoch_runs(subject, runs, label_map, tmin, tmax, fmin, fmax, verbose):
     return data, cmds, epochs.info["sfreq"], epochs.ch_names
 
 
-def load_eegbci(subject: int = 1, tmin: float = 0.5, tmax: float = 3.5,
-                fmin: float = 7.0, fmax: float = 30.0, verbose: str | bool = "ERROR") -> BCIDataset:
-    """Download (if needed) and assemble a 4-command dataset for one subject.
+_CACHE_PATH = "/tmp/neuralsim_cache.pkl"
 
-    Combines left/right imagery runs (LEFT/RIGHT/IDLE) with fists/feet imagery
-    runs (SELECT). Requires network access on first run to fetch from PhysioNet.
-    """
+
+def _load_one_subject(subject: int, tmin: float, tmax: float,
+                      fmin: float, fmax: float, verbose) -> BCIDataset:
     lr_data, lr_cmds, sfreq, ch = _epoch_runs(
         subject, LR_RUNS, LR_MAP, tmin, tmax, fmin, fmax, verbose)
     sel_data, sel_cmds, _, _ = _epoch_runs(
@@ -108,6 +106,61 @@ def load_eegbci(subject: int = 1, tmin: float = 0.5, tmax: float = 3.5,
 
     signals = np.concatenate(parts_d, axis=0)
     return BCIDataset(signals=signals, commands=parts_c, sfreq=sfreq, ch_names=ch)
+
+
+def load_eegbci(subject: int = 1, tmin: float = 0.5, tmax: float = 3.5,
+                fmin: float = 7.0, fmax: float = 30.0, verbose: str | bool = "ERROR",
+                subjects: int = 1) -> BCIDataset:
+    """Download (if needed) and assemble a 4-command dataset.
+
+    subjects=1  (default) loads only *subject* (default S001).
+    subjects=N  loads subjects 1 … N and concatenates them.
+
+    Results are cached to /tmp/neuralsim_cache.pkl keyed by all load
+    parameters, so repeated calls with the same arguments are instant.
+    """
+    import os
+    import pickle
+
+    if subjects > 1:
+        cache_key = ("multi", subjects, tmin, tmax, fmin, fmax)
+    else:
+        cache_key = ("single", subject, tmin, tmax, fmin, fmax)
+
+    cache: dict = {}
+    if os.path.exists(_CACHE_PATH):
+        try:
+            with open(_CACHE_PATH, "rb") as f:
+                cache = pickle.load(f)
+            if cache_key in cache:
+                return cache[cache_key]
+        except Exception:
+            cache = {}
+
+    if subjects > 1:
+        datasets: list[BCIDataset] = []
+        for s in range(1, subjects + 1):
+            try:
+                datasets.append(_load_one_subject(s, tmin, tmax, fmin, fmax, verbose))
+            except Exception:
+                continue
+        if not datasets:
+            raise RuntimeError("No subjects loaded successfully")
+        signals = np.concatenate([d.signals for d in datasets], axis=0)
+        commands = [c for d in datasets for c in d.commands]
+        result = BCIDataset(signals=signals, commands=commands,
+                            sfreq=datasets[0].sfreq, ch_names=datasets[0].ch_names)
+    else:
+        result = _load_one_subject(subject, tmin, tmax, fmin, fmax, verbose)
+
+    try:
+        cache[cache_key] = result
+        with open(_CACHE_PATH, "wb") as f:
+            pickle.dump(cache, f)
+    except Exception:
+        pass
+
+    return result
 
 
 def load_eegbci_multi(subjects=None, **kwargs) -> BCIDataset:
