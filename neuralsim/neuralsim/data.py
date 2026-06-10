@@ -25,8 +25,8 @@ from .commands import (
 # Motor-cortex channels we prefer for decoding (intersected with availability).
 MOTOR_CHANNELS = [
     "C3", "C1", "Cz", "C2", "C4",
-    "Cp3", "Cp1", "Cpz", "Cp2", "Cp4",
-    "Fc3", "Fc1", "Fcz", "Fc2", "Fc4",
+    "CP3", "CP1", "CPz", "CP2", "CP4",
+    "FC3", "FC1", "FCz", "FC2", "FC4",
 ]
 
 
@@ -108,6 +108,33 @@ def load_eegbci(subject: int = 1, tmin: float = 0.5, tmax: float = 3.5,
 
     signals = np.concatenate(parts_d, axis=0)
     return BCIDataset(signals=signals, commands=parts_c, sfreq=sfreq, ch_names=ch)
+
+
+def load_eegbci_multi(subjects=None, **kwargs) -> BCIDataset:
+    """Load and concatenate PhysioNet EEGBCI for multiple subjects.
+
+    Parameters
+    ----------
+    subjects : iterable of int, optional
+        Subject IDs to load (1-109). Defaults to all 109.
+        Subjects that fail to load (network errors, bad data) are skipped.
+    **kwargs
+        Forwarded to :func:`load_eegbci` (tmin, tmax, fmin, fmax, verbose).
+    """
+    if subjects is None:
+        subjects = range(1, 110)
+    datasets: list[BCIDataset] = []
+    for s in subjects:
+        try:
+            datasets.append(load_eegbci(subject=s, **kwargs))
+        except Exception:
+            continue
+    if not datasets:
+        raise RuntimeError("No subjects loaded successfully")
+    signals = np.concatenate([d.signals for d in datasets], axis=0)
+    commands = [c for d in datasets for c in d.commands]
+    return BCIDataset(signals=signals, commands=commands,
+                      sfreq=datasets[0].sfreq, ch_names=datasets[0].ch_names)
 
 
 def make_synthetic(n_per_class: int = 30, n_channels: int = 9, sfreq: float = 160.0,
