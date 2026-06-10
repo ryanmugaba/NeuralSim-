@@ -5,6 +5,7 @@ pyproject.toml
 requirements.txt
 setup.py
 neuralsim/__init__.py
+neuralsim/calibration.py
 neuralsim/commands.py
 neuralsim/data.py
 neuralsim/decoder.py

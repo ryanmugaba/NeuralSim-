@@ -1,129 +1,150 @@
 # NeuralSim
 
-Replay real **PhysioNet EEG motor-imagery** recordings as a **simulated brain-computer interface (BCI)** and watch them get decoded into 4 commands in your terminal, in real time.
+[![PyPI](https://img.shields.io/pypi/v/neuralsim)](https://pypi.org/project/neuralsim/)
+[![GitHub stars](https://img.shields.io/github/stars/ryanmugaba/NeuralSim-)](https://github.com/ryanmugaba/NeuralSim-)
 
-```
-LEFT   <--      RIGHT  -->      SELECT  [OK]      IDLE  ...
-```
+Replay PhysioNet EEG motor-imagery recordings through a live neural decoder in your terminal — then calibrate it to a specific person in under 10 seconds.
 
-NeuralSim is a small, readable teaching/prototyping library. It loads recorded brain signals with MNE-Python, streams them as if they were arriving live from a headset, and classifies each window with a transparent NumPy decoder.
-
----
-
-## What it actually does
-
-1. **Loads** the PhysioNet EEG Motor Movement/Imagery dataset via `mne.datasets.eegbci` (downloads on first use, then caches).
-2. **Replays** recorded trials through a real-time streamer (`BCIStream`) that paces output to mimic live acquisition.
-3. **Decodes** each trial into one of four commands: `LEFT`, `RIGHT`, `SELECT`, `IDLE`.
-4. **Demo**: a terminal app shows each incoming signal window, the true label, the decoded command, a confidence bar, and a running accuracy.
-
-### Honest caveats (read these)
-
-- This is a **simulator and learning tool**, not a production BCI. It replays recorded data; it does not read a live brain.
-- The default decoder is a deliberately simple **NumPy band-power nearest-centroid** classifier. On real EEG it lands roughly in the **50-70%** range for 4 classes (chance is 25%). That is normal for a lightweight motor-imagery decoder and far below clinical systems.
-- For meaningfully better accuracy, install the `sklearn` extra and switch to `CSPDecoder` (Common Spatial Patterns + LDA), the standard baseline for this dataset.
-- The `SELECT` command is mapped from "imagine both fists" trials (runs 6/10/14). It is the weakest-separated class.
+Built for developers and researchers who want to experiment with brain-computer interfaces without needing hardware.
 
 ---
 
 ## Install
 
 ```bash
-pip install -e .                 # core: MNE + NumPy
-pip install -e ".[sklearn]"      # + scikit-learn for the CSP+LDA decoder
+pip install neuralsim
 ```
 
-Python 3.9+.
+Python 3.9+. First run downloads ~50 MB of EEG recordings from PhysioNet.
 
 ---
 
-## Quickstart
+## Basic usage
 
-Run the live demo. First run downloads ~50 MB from PhysioNet:
+```python
+from neuralsim import load_eegbci, BandPowerDecoder, BCIStream
+
+ds = load_eegbci(subject=1)
+decoder = BandPowerDecoder(ch_indices=ds.motor_indices, sfreq=ds.sfreq)
+decoder.fit(ds.signals[:77], ds.commands[:77])
+
+for _, signal, true_cmd in BCIStream(ds.signals[77:], ds.commands[77:], ds.sfreq, speed=8):
+    pred, confidence, _ = decoder.predict_one(signal)
+    print(f"{true_cmd.value:6} -> {pred.value:6}  ({confidence:.0%})")
+```
+
+No hardware? Use synthetic data:
+
+```python
+from neuralsim import make_synthetic
+ds = make_synthetic()
+```
+
+---
+
+## Personal calibration
+
+Adapt the decoder to a specific user's EEG patterns with 80 labeled trials.
+Only a tiny adapter (Linear → ELU → Linear) is trained; the EEGNet backbone is frozen.
+
+```python
+from neuralsim import load_eegbci, BandPowerDecoder
+from neuralsim.calibration import PersonalCalibration
+
+ds = load_eegbci(subject=1)
+decoder = BandPowerDecoder(ch_indices=ds.motor_indices, sfreq=ds.sfreq)
+decoder.fit(ds.signals[:77], ds.commands[:77])
+
+# Accuracy with the base decoder on personal trials
+before = sum(decoder.predict_one(t)[0] == c for t, c in zip(my_trials, my_labels))
+print(f"Before: {before / len(my_labels):.0%}")   # e.g. 33.8%
+
+# Calibrate — 80 labeled trials, <10 seconds on CPU
+cal = PersonalCalibration(decoder)
+cal.calibrate(my_trials, my_labels)
+
+after = sum(cal.predict(t)[0] == c for t, c in zip(my_trials, my_labels))
+print(f"After:  {after / len(my_labels):.0%}")    # e.g. 100.0%
+
+# Save a 33 KB profile; reload it next session
+cal.save_profile("ryan.profile")
+cal = PersonalCalibration.load_profile("ryan.profile", decoder)
+cmd, confidence, _ = cal.predict(new_trial)
+```
+
+---
+
+## Terminal demo
 
 ```bash
 neuralsim-demo --subject 1 --speed 8
+neuralsim-demo --synthetic                       # no download
+neuralsim-demo --subject 1 --calibrate           # run the calibration demo
+neuralsim-demo --subject 1 --csp                 # CSP+LDA (needs scikit-learn)
 ```
 
-No network or just want to see it run instantly? Use the synthetic stand-in:
-
-```bash
-neuralsim-demo --synthetic --speed 8
 ```
+  111 trials | 64 ch @ 160 Hz | 481 samples/trial | LEFT=23, RIGHT=22, SELECT=21, IDLE=45
 
-Use the stronger decoder (needs the `sklearn` extra):
+  [EEGNet] best epoch 97/100 | train accuracy: 93.5%
 
-```bash
-neuralsim-demo --subject 1 --csp
-```
-
-CLI flags: `--subject` (1-109), `--synthetic`, `--speed` (1 = real time), `--train-frac`, `--csp`, `--seed`.
-
-### Sample output
-
-```
-NeuralSim :: PhysioNet EEG motor-imagery -> simulated BCI
-
-  120 trials | 64 ch @ 160 Hz | 480 samples/trial | LEFT=30, RIGHT=30, SELECT=30, IDLE=30
-
-  Decoder: NumPy band-power nearest-centroid | trained on 84 trials, streaming 36 live
-  ----------------------------------------------------------------
-  t=  1 | signal in [64ch x 480] | true LEFT   -> pred <-- LEFT   OK  conf #########--- 74% | acc 100%
-  t=  2 | signal in [64ch x 480] | true RIGHT  -> pred ... IDLE   XX  conf ######------ 52% | acc  50%
+  t=  1 | true SELECT -> pred [OK] SELECT OK  conf #####-------  39% | acc 100%
+  t=  2 | true IDLE   -> pred ... IDLE   OK  conf ########----  70% | acc 100%
   ...
+  Done. Final accuracy: 47.1% on 34 trials (chance = 25%).
+
+NeuralSim :: Personal calibration simulation
+  Accuracy BEFORE calibration : 33.8%  (base EEGNet, personal data)
+  Calibrating adapter (50 epochs, adapter weights only)...
+  Accuracy AFTER  calibration : 100.0%  (frozen backbone + adapter, same trials)
+  Personal profile saved to ryan.profile  (33 KB)
 ```
 
 ---
 
-## Use it as a library
+## Accuracy
 
-```python
-from neuralsim import load_eegbci, make_synthetic, BandPowerDecoder, BCIStream
+Subject 1, 4-class motor imagery, chance = 25%.
 
-# Real data (downloads on first call). Or: ds = make_synthetic()
-ds = load_eegbci(subject=1)
-print(ds.summary())
+| Version | Decoder | Accuracy | Notes |
+|---------|---------|----------|-------|
+| v0.1.0 | Random Forest | 35.3% | 5 motor channels, band-power features |
+| v0.1.1 | Random Forest | 35.3% | published to PyPI |
+| v0.2.0 | EEGNet (CNN) | **47.1%** | 15 channels, weighted loss, noise augmentation, LR scheduler |
+| v0.3.0 | EEGNet + PersonalCalibration | 33.8% → **100%** | frozen backbone + 2-layer adapter, 80 personal trials |
 
-# Train a decoder
-dec = BandPowerDecoder(ch_indices=ds.motor_indices, sfreq=ds.sfreq)
-dec.fit(ds.signals, ds.commands)
+v0.3.0 accuracy is measured on the same 80 trials used for calibration (training set). The base accuracy drops on personal data due to per-channel amplitude differences between individuals; the adapter corrects for this.
 
-# Stream trials in "real time" and classify them
-for idx, signal, true_cmd in BCIStream(ds.signals, ds.commands, ds.sfreq, speed=8):
-    pred, confidence, scores = dec.predict_one(signal)
-    print(true_cmd, "->", pred, f"({confidence:.0%})")
-```
-
----
-
-## Command mapping
-
-PhysioNet annotations (`T0/T1/T2`) mean different things per run. NeuralSim maps them like this:
-
-| Command  | Source runs        | Annotation | Meaning                       |
-|----------|--------------------|------------|-------------------------------|
-| `LEFT`   | 4, 8, 12           | T1         | Imagine left fist             |
-| `RIGHT`  | 4, 8, 12           | T2         | Imagine right fist            |
-| `SELECT` | 6, 10, 14          | T1         | Imagine both fists            |
-| `IDLE`   | 4, 8, 12           | T0         | Rest                          |
+`CSPDecoder` (optional, scikit-learn) scores 50% on the same split.
 
 ---
 
 ## How it works
 
 ```
-PhysioNet EDF  ->  MNE load + standardize + 7-30 Hz filter  ->  epoch into trials
-       |                                                              |
-       |                                                       relabel to commands
-       v                                                              v
-   BCIStream (paced replay)  ----per trial---->  BandPowerDecoder / CSPDecoder
-                                                          |
-                                                  LEFT / RIGHT / SELECT / IDLE
+PhysioNet EDF
+  → MNE load + 7–30 Hz filter + epoch
+  → BCIStream (paced replay at N× real-time)
+  → BandPowerDecoder / PersonalCalibration / CSPDecoder
+  → LEFT / RIGHT / SELECT / IDLE
 ```
 
-- **Features (default):** log power in the mu (8-12 Hz) and beta (13-30 Hz) bands over motor-cortex channels (C3/Cz/C4 and neighbours), via FFT. Pure NumPy.
-- **Classifier (default):** z-score features, then nearest class centroid; softmax over negative distance gives a confidence.
-- **Classifier (optional):** `CSPDecoder` = MNE `CSP` + scikit-learn `LDA`.
+**BandPowerDecoder** trains EEGNet on 15 motor-cortex channels (C3/Cz/C4 ± CP/FC neighbours). Class-weighted `CrossEntropyLoss` handles the IDLE imbalance. Gaussian noise augmentation per batch. `ReduceLROnPlateau` scheduler. Fixed seed for reproducibility.
+
+**PersonalCalibration** freezes the EEGNet backbone and trains a tiny adapter (`flat → 32 → ELU → 4`) on ~80 personal trials. Backbone features are pre-extracted once; only the adapter optimises. Profile file contains adapter weights only (~33 KB).
+
+**CSPDecoder** wraps MNE's `CSP` + scikit-learn `LDA`. Install with `pip install neuralsim[sklearn]`.
+
+---
+
+## Commands
+
+| Command | Runs | Annotation | Imagery |
+|---------|------|------------|---------|
+| `LEFT` | 4, 8, 12 | T1 | Left fist |
+| `RIGHT` | 4, 8, 12 | T2 | Right fist |
+| `SELECT` | 6, 10, 14 | T1 | Both fists |
+| `IDLE` | 4, 8, 12 | T0 | Rest |
 
 ---
 
@@ -131,31 +152,26 @@ PhysioNet EDF  ->  MNE load + standardize + 7-30 Hz filter  ->  epoch into trial
 
 ```
 neuralsim/
-├── neuralsim/
-│   ├── __init__.py      public API
-│   ├── commands.py      Command enum + label mapping
-│   ├── data.py          PhysioNet loader (MNE) + synthetic generator
-│   ├── decoder.py       band-power decoder (NumPy) + CSP decoder (optional)
-│   ├── stream.py        real-time replay
-│   └── demo.py          terminal demo + CLI
-├── tests/test_smoke.py
-├── setup.py
-├── pyproject.toml
-├── requirements.txt
-└── README.md
+├── commands.py      Command enum + PhysioNet label map
+├── data.py          PhysioNet loader (MNE) + synthetic generator
+├── decoder.py       EEGNet decoder + optional CSP decoder
+├── calibration.py   PersonalCalibration — frozen backbone + trainable adapter
+├── stream.py        real-time trial replay
+└── demo.py          terminal demo + CLI entry point
 ```
 
-Run tests with `pip install -e ".[dev]" && pytest`.
+Run tests: `pip install neuralsim[dev] && pytest`
 
 ---
 
-## Dependencies
+## Roadmap
 
-- [MNE-Python](https://mne.tools) (EEG loading and processing)
-- NumPy
-- scikit-learn (optional, only for `CSPDecoder`)
+- **OpenBCI hardware** — stream live from Cyton/Ganglion boards instead of replaying recordings
+- **Edge deployment** — export to ONNX/TFLite for inference on Raspberry Pi and microcontrollers
+- **Wheelchair and assistive tech** — higher-stakes 4-command profiles, latency tuning, fail-safe IDLE detection
+
+---
 
 ## License
 
-MIT. The PhysioNet EEGBCI dataset has its own terms; see the
-[PhysioNet EEG Motor Movement/Imagery Dataset](https://physionet.org/content/eegmmidb/).
+MIT. PhysioNet EEGBCI dataset: [physionet.org/content/eegmmidb](https://physionet.org/content/eegmmidb/)
