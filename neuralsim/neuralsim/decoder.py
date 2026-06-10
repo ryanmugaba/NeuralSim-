@@ -1,8 +1,7 @@
 """Signal decoding: turn an EEG trial into one of the 4 commands.
 
-BandPowerDecoder uses log band power across delta/theta/alpha/beta/gamma bands
-and a scikit-learn RandomForestClassifier with 5-fold cross-validation at fit
-time.  CSPDecoder is kept unchanged.
+BandPowerDecoder uses MNE CSP spatial filtering followed by an SVM (RBF kernel)
+with 5-fold cross-validation at fit time.  CSPDecoder is kept unchanged.
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ def band_power(trial: np.ndarray, sfreq: float, bands=DEFAULT_BANDS) -> np.ndarr
 
 
 class BandPowerDecoder:
-    """Random Forest decoder over 5-band (delta/theta/alpha/beta/gamma) power features."""
+    """CSP + SVM (RBF) decoder for motor imagery EEG classification."""
 
     def __init__(self, ch_indices=None, sfreq: float = 160.0, bands=DEFAULT_BANDS):
         self.ch_indices = ch_indices
@@ -67,27 +66,26 @@ class BandPowerDecoder:
 
     def fit(self, X, y) -> "BandPowerDecoder":
         """Fit on trials X (n_trials, n_ch, n_times) and labels y."""
-        from sklearn.ensemble import RandomForestClassifier
+        from mne.decoding import CSP
+        from sklearn.svm import SVC
+        from sklearn.pipeline import Pipeline
         from sklearn.model_selection import cross_val_score
 
-        F = self._features(X)
         y_vals = np.array([Command(v).value for v in y])
         self.classes_ = sorted(set(y_vals.tolist()))
         self._class_map = {c: i for i, c in enumerate(self.classes_)}
         yi = np.array([self._class_map[v] for v in y_vals])
 
-        self._clf = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_leaf=1,
-            max_features="sqrt",
-            class_weight="balanced",
-            random_state=0,
-            n_jobs=-1,
-        )
-        cv_scores = cross_val_score(self._clf, F, yi, cv=5, scoring="accuracy")
-        print(f"  [RF] 5-fold CV accuracy: {cv_scores.mean():.1%} ± {cv_scores.std():.1%}")
-        self._clf.fit(F, yi)
+        X_arr = np.array([self._pick(t) for t in X], dtype=float)
+        n_components = min(6, X_arr.shape[1] - 1)
+
+        self._clf = Pipeline([
+            ("csp", CSP(n_components=n_components, reg=None, log=True)),
+            ("svm", SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=0)),
+        ])
+        cv_scores = cross_val_score(self._clf, X_arr, yi, cv=5, scoring="accuracy")
+        print(f"  [CSP+SVM] 5-fold CV accuracy: {cv_scores.mean():.1%} ± {cv_scores.std():.1%}")
+        self._clf.fit(X_arr, yi)
         return self
 
     def predict_one(self, trial: np.ndarray):
@@ -98,8 +96,8 @@ class BandPowerDecoder:
         """
         if self._clf is None:
             raise RuntimeError("Decoder is not fitted. Call fit() first.")
-        f = band_power(self._pick(trial), self.sfreq, self.bands)
-        proba = self._clf.predict_proba(f[None])[0]
+        t = self._pick(trial)
+        proba = self._clf.predict_proba(t[None])[0]
         best_idx = int(np.argmax(proba))
         best_class = self.classes_[best_idx]
         scores = {c: float(p) for c, p in zip(self.classes_, proba)}
